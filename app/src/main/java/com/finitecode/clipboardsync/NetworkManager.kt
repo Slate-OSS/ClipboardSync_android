@@ -8,8 +8,7 @@ import kotlinx.serialization.json.Json
 import java.io.*
 import java.net.Socket
 import java.net.SocketException
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
+import kotlin.math.min
 
 class NetworkManager(
     private val deviceId: String,
@@ -22,7 +21,11 @@ class NetworkManager(
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var reconnectJob: Job? = null
     private var receiveJob: Job? = null
+    private var pingJob: Job? = null
     private var isManualDisconnect = false
+
+    private var lastMacIp: String? = null
+    private var lastPort: Int = 8765
 
     var connectionStatus: ConnectionStatus = ConnectionStatus.DISCONNECTED
         private set
@@ -33,6 +36,8 @@ class NetworkManager(
     fun connect(macIp: String, port: Int = 8765, attempt: Int = 1) {
         if (attempt == 1) {
             isManualDisconnect = false
+            lastMacIp = macIp
+            lastPort = port
         }
 
         updateStatus(ConnectionStatus.CONNECTING)
@@ -42,7 +47,7 @@ class NetworkManager(
             try {
                 // Create plain TCP socket (matches Mac server)
                 socket = Socket(macIp, port).apply {
-                    soTimeout = 0 // No read timeout
+                    soTimeout = 60000 // 60s read timeout
                     keepAlive = true
                     tcpNoDelay = true
                 }
@@ -56,6 +61,9 @@ class NetworkManager(
 
                 // Send handshake immediately
                 sendHandshake()
+
+                // Start ping keep-alive
+                startPingKeepAlive()
 
                 // Start receive loop
                 startReceiving()
@@ -76,6 +84,7 @@ class NetworkManager(
         isManualDisconnect = true
         reconnectJob?.cancel()
         receiveJob?.cancel()
+        pingJob?.cancel()
 
         try {
             outputStream?.close()
@@ -104,6 +113,29 @@ class NetworkManager(
         )
         sendMessage(handshake)
         Log.d(TAG, "🤝 Sent handshake")
+    }
+
+    // Keep-alive ping every 30 seconds
+    private fun startPingKeepAlive() {
+        pingJob?.cancel()
+        pingJob = scope.launch {
+            while (isActive && socket?.isConnected == true) {
+                delay(30000) // 30 seconds
+
+                val ping = SyncMessage(
+                    type = "ping",
+                    fromDeviceId = deviceId,
+                    toDeviceId = null,
+                    timestamp = System.currentTimeMillis(),
+                    payload = ""
+                )
+
+                if (!sendMessage(ping)) {
+                    Log.w(TAG, "⚠️ Ping failed - connection may be dead")
+                    break
+                }
+            }
+        }
     }
 
     // Send sync message with length-prefix framing
@@ -142,7 +174,7 @@ class NetworkManager(
 
             try {
                 while (isActive && socket?.isConnected == true) {
-                    // Read 4-byte length prefix
+                    // Read 4-byte length prefix (big-endian)
                     val length = stream.readInt()
 
                     if (length <= 0 || length > 1_000_000) { // Sanity check: max 1MB
@@ -165,8 +197,11 @@ class NetworkManager(
                 Log.e(TAG, "🔌 Connection closed by server")
             } catch (e: Exception) {
                 Log.e(TAG, "❌ Receive error: ${e.message}")
+                e.printStackTrace()
             } finally {
-                handleConnectionError(Exception("Connection closed"))
+                if (!isManualDisconnect) {
+                    handleConnectionError(Exception("Connection closed"))
+                }
             }
         }
     }
@@ -188,18 +223,19 @@ class NetworkManager(
 
     // Handle connection errors
     private fun handleConnectionError(error: Exception) {
+        if (isManualDisconnect) return
+
+        Log.w(TAG, "🔄 Handling connection error, will reconnect")
         updateStatus(ConnectionStatus.ERROR(error.message ?: "Unknown error"))
 
-        // Save connection params for reconnect
-        val currentSocket = socket
-        val host = currentSocket?.inetAddress?.hostAddress
-        val port = currentSocket?.port ?: 8765
+        val ip = lastMacIp
+        val port = lastPort
 
         disconnect()
 
         // Auto-reconnect
-        if (!isManualDisconnect && host != null) {
-            scheduleReconnect(host, port, 1)
+        if (!isManualDisconnect && ip != null) {
+            scheduleReconnect(ip, port, 1)
         }
     }
 
@@ -208,7 +244,7 @@ class NetworkManager(
         reconnectJob?.cancel()
 
         val nextAttempt = attempt + 1
-        val delay = Math.min(2000L * (1 shl (attempt - 1)), 30000L) // Max 30s
+        val delay = min(2000L * (1 shl (attempt - 1)), 30000L) // Max 30s
         Log.d(TAG, "⏱️ Scheduling reconnect in ${delay}ms (attempt #$nextAttempt)")
 
         reconnectJob = scope.launch {
@@ -221,7 +257,7 @@ class NetworkManager(
 
     private fun updateStatus(status: ConnectionStatus) {
         connectionStatus = status
-        onConnectionStatusChanged?.invoke(status)  // Direct callback
+        onConnectionStatusChanged?.invoke(status)
     }
 
     fun cleanup() {
