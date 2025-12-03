@@ -1,6 +1,7 @@
 package com.finitecode.clipboardsync
 
 import android.os.Bundle
+import android.content.Context
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.*
@@ -13,23 +14,69 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.material.icons.Icons
 import com.finitecode.clipboardsync.ui.theme.ClipboardSyncTheme
-
-
-// Import the dramatic icons :/
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Delete
 
 class MainActivity : ComponentActivity() {
+    private lateinit var networkManager: NetworkManager
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         val clipboardManager = ClipboardManagerWrapper(this)
         val pairingManager = DevicePairingManager(this)
 
+        // Create NetworkManager
+        networkManager = NetworkManager(
+            deviceId = pairingManager.currentDeviceId.value,
+            onMessageReceived = { message ->
+                handleIncomingMessage(message, clipboardManager, pairingManager)
+            }
+        )
+
         setContent {
             ClipboardSyncTheme {
-                ClipboardSyncApp(clipboardManager, pairingManager)
+                ClipboardSyncApp(clipboardManager, pairingManager, networkManager)
+            }
+        }
+    }
+
+    private fun handleIncomingMessage(
+        message: SyncMessage,
+        clipboardManager: ClipboardManagerWrapper,
+        pairingManager: DevicePairingManager
+    ) {
+        when (message.type) {
+            "clipboard_update" -> {
+                // Find paired device
+                val device = pairingManager.pairedDevices.find {
+                    it.remoteDeviceId == message.fromDeviceId
+                }
+
+                if (device == null) {
+                    println("⚠️ Message from unknown device: ${message.fromDeviceId.take(8)}")
+                    return
+                }
+
+                // Decrypt and update clipboard
+                val item = MessageProtocol.decodeClipboardMessage(message, device.sharedKey)
+                if (item != null) {
+                    clipboardManager.copyToClipboard(item.content)
+                    clipboardManager.clipboardHistory.add(0, item)
+                    if (clipboardManager.clipboardHistory.size > 50) {
+                        clipboardManager.clipboardHistory.removeAt(50)
+                    }
+                    println("📥 Received clipboard from ${device.name}")
+                }
+            }
+
+            "ping" -> {
+                println("🏓 Received ping from ${message.fromDeviceId.take(8)}")
+            }
+
+            else -> {
+                println("⚠️ Unknown message type: ${message.type}")
             }
         }
     }
@@ -38,7 +85,8 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun ClipboardSyncApp(
     clipboardManager: ClipboardManagerWrapper,
-    pairingManager: DevicePairingManager
+    pairingManager: DevicePairingManager,
+    networkManager: NetworkManager
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
 
@@ -52,8 +100,8 @@ fun ClipboardSyncApp(
                     onClick = { selectedTab = 0 }
                 )
                 NavigationBarItem(
-                    icon = { Icon(Icons.Default.Settings, contentDescription = "Pairing") },
-                    label = { Text("Pairing") },
+                    icon = { Icon(Icons.Default.Settings, contentDescription = "Settings") },
+                    label = { Text("Settings") },
                     selected = selectedTab == 1,
                     onClick = { selectedTab = 1 }
                 )
@@ -62,8 +110,8 @@ fun ClipboardSyncApp(
     ) { paddingValues ->
         Box(modifier = Modifier.padding(paddingValues)) {
             when (selectedTab) {
-                0 -> MonitorScreen(clipboardManager, pairingManager)
-                1 -> PairingScreen(pairingManager)
+                0 -> MonitorScreen(clipboardManager, pairingManager, networkManager)
+                1 -> SettingsScreen(pairingManager, networkManager)
             }
         }
     }
@@ -72,12 +120,22 @@ fun ClipboardSyncApp(
 @Composable
 fun MonitorScreen(
     clipboardManager: ClipboardManagerWrapper,
-    pairingManager: DevicePairingManager
+    pairingManager: DevicePairingManager,
+    networkManager: NetworkManager
 ) {
     val isMonitoring by clipboardManager.isMonitoring
     val content by clipboardManager.clipboardContent
     val history = clipboardManager.clipboardHistory
     val pairedCount = pairingManager.pairedDevices.size
+
+    var connectionStatus by remember { mutableStateOf<ConnectionStatus>(ConnectionStatus.DISCONNECTED) }
+
+// Update connection status
+    LaunchedEffect(Unit) {
+        networkManager.onConnectionStatusChanged = { status ->
+            connectionStatus = status
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -85,6 +143,42 @@ fun MonitorScreen(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
+        // Connection Status Card
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(
+                containerColor = when (connectionStatus) {
+                    is ConnectionStatus.CONNECTED -> MaterialTheme.colorScheme.primaryContainer
+                    is ConnectionStatus.CONNECTING -> MaterialTheme.colorScheme.secondaryContainer
+                    else -> MaterialTheme.colorScheme.errorContainer
+                }
+            )
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    modifier = Modifier.size(12.dp),
+                    shape = MaterialTheme.shapes.small,
+                    color = when (connectionStatus) {
+                        is ConnectionStatus.CONNECTED -> MaterialTheme.colorScheme.primary
+                        is ConnectionStatus.CONNECTING -> MaterialTheme.colorScheme.secondary
+                        else -> MaterialTheme.colorScheme.error
+                    }
+
+                ) {}
+
+                Text(
+                    connectionStatus.displayString(),
+                    style = MaterialTheme.typography.labelMedium
+                )
+            }
+        }
+
         // Header
         Card(
             modifier = Modifier.fillMaxWidth(),
@@ -113,7 +207,6 @@ fun MonitorScreen(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Status indicator
                 Surface(
                     modifier = Modifier.size(12.dp),
                     shape = MaterialTheme.shapes.small,
@@ -206,11 +299,16 @@ fun MonitorScreen(
 }
 
 @Composable
-fun PairingScreen(pairingManager: DevicePairingManager) {
+fun SettingsScreen(
+    pairingManager: DevicePairingManager,
+    networkManager: NetworkManager
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     val devices = pairingManager.pairedDevices
     val deviceId by pairingManager.currentDeviceId
     var manualCode by remember { mutableStateOf("") }
     var message by remember { mutableStateOf("") }
+    var macIp by remember { mutableStateOf(loadMacIp(context)) }
 
     Column(
         modifier = Modifier
@@ -218,7 +316,52 @@ fun PairingScreen(pairingManager: DevicePairingManager) {
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        // Header with Device ID
+        // Connection Settings
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    "Mac Connection",
+                    style = MaterialTheme.typography.labelMedium
+                )
+
+                TextField(
+                    value = macIp,
+                    onValueChange = { macIp = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Mac IP Address") },
+                    placeholder = { Text("192.168.1.100") },
+                    singleLine = true
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = {
+                            saveMacIp(context, macIp)
+                            networkManager.connect(macIp)
+                        },
+                        modifier = Modifier.weight(1f),
+                        enabled = macIp.isNotBlank()
+                    ) {
+                        Text("Connect")
+                    }
+
+                    OutlinedButton(
+                        onClick = { networkManager.disconnect() },
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Text("Disconnect")
+                    }
+                }
+            }
+        }
+
+        // Device ID
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
@@ -237,7 +380,7 @@ fun PairingScreen(pairingManager: DevicePairingManager) {
             }
         }
 
-        // Manual pairing code entry
+        // Manual pairing
         Card(modifier = Modifier.fillMaxWidth()) {
             Column(
                 modifier = Modifier.padding(12.dp),
@@ -265,8 +408,7 @@ fun PairingScreen(pairingManager: DevicePairingManager) {
                             manualCode = ""
                         }
                     },
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+                    modifier = Modifier.fillMaxWidth()
                 ) {
                     Text("Add Device")
                 }
@@ -281,7 +423,7 @@ fun PairingScreen(pairingManager: DevicePairingManager) {
             }
         }
 
-        // Paired devices list
+        // Paired devices
         Card(
             modifier = Modifier
                 .fillMaxWidth()
@@ -340,4 +482,16 @@ fun PairingScreen(pairingManager: DevicePairingManager) {
             }
         }
     }
+}
+
+private fun saveMacIp(context: Context, ip: String) {
+    context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+        .edit()
+        .putString("mac_ip", ip)
+        .apply()
+}
+
+private fun loadMacIp(context: Context): String {
+    return context.getSharedPreferences("settings", Context.MODE_PRIVATE)
+        .getString("mac_ip", "") ?: ""
 }

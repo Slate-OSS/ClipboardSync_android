@@ -6,7 +6,7 @@ import android.content.ClipData
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
+
 
 class ClipboardManagerWrapper(private val context: Context) {
     private val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -66,14 +66,4 @@ data class ClipboardItem(
     val content: String,
     val timestamp: Long,
     val type: String
-) {
-    fun toJson(): String = Json.encodeToString(serializer(), this)
-
-    companion object {
-        fun fromJson(json: String): ClipboardItem? = try {
-            Json.decodeFromString(serializer(), json)
-        } catch (e: Exception) {
-            null
-        }
-    }
-}
+)
