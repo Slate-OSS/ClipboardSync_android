@@ -5,21 +5,23 @@ import kotlinx.coroutines.*
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import okhttp3.*
-import java.util.concurrent.TimeUnit
+import java.io.*
+import java.net.Socket
+import java.net.SocketException
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class NetworkManager(
     private val deviceId: String,
     private val onMessageReceived: (SyncMessage) -> Unit
 ) {
-    private var webSocket: WebSocket? = null
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.MILLISECONDS) // no timeout for WebSocket
-        .build()
+    private var socket: Socket? = null
+    private var outputStream: DataOutputStream? = null
+    private var inputStream: DataInputStream? = null
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var reconnectJob: Job? = null
+    private var receiveJob: Job? = null
     private var isManualDisconnect = false
 
     var connectionStatus: ConnectionStatus = ConnectionStatus.DISCONNECTED
@@ -27,76 +29,66 @@ class NetworkManager(
 
     var onConnectionStatusChanged: ((ConnectionStatus) -> Unit)? = null
 
-    // Connect to Mac server
+    // Connect to Mac server using plain TCP
     fun connect(macIp: String, port: Int = 8765, attempt: Int = 1) {
         if (attempt == 1) {
             isManualDisconnect = false
         }
-        Log.d(TAG, "🔗 Connecting to ws://$macIp:$port (attempt #$attempt)")
 
-        val request = Request.Builder()
-            .url("ws://$macIp:$port")
-            .build()
+        updateStatus(ConnectionStatus.CONNECTING)
+        Log.d(TAG, "🔗 Connecting to TCP $macIp:$port (attempt #$attempt)")
 
-        webSocket = client.newWebSocket(request, object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                Log.d(TAG, "✅ WebSocket connected")
-                reconnectJob?.cancel() // Cancel any reconnect jobs
+        scope.launch {
+            try {
+                // Create plain TCP socket (matches Mac server)
+                socket = Socket(macIp, port).apply {
+                    soTimeout = 0 // No read timeout
+                    keepAlive = true
+                    tcpNoDelay = true
+                }
+
+                outputStream = DataOutputStream(BufferedOutputStream(socket!!.getOutputStream()))
+                inputStream = DataInputStream(BufferedInputStream(socket!!.getInputStream()))
+
+                Log.d(TAG, "✅ TCP connected to $macIp:$port")
+                reconnectJob?.cancel()
                 updateStatus(ConnectionStatus.CONNECTED)
 
                 // Send handshake immediately
                 sendHandshake()
-            }
 
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                Log.d(TAG, "📨 Received text: ${text.take(100)}")
-                handleMessage(text)
-            }
+                // Start receive loop
+                startReceiving()
 
-            override fun onMessage(webSocket: WebSocket, bytes: okio.ByteString) {
-                try {
-                    val text = bytes.utf8()
-                    Log.d(TAG, "📨 Received bytes: ${text.take(100)}")
-                    handleMessage(text)
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error decoding UTF-8 from bytes: ${e.message}")
-                }
-            }
-
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.e(TAG, "❌ WebSocket failure: ${t.message}")
-                updateStatus(ConnectionStatus.ERROR(t.message ?: "Connection failed"))
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Connection failed: ${e.message}")
+                updateStatus(ConnectionStatus.ERROR(e.message ?: "Connection failed"))
 
                 // Auto-reconnect unless manual disconnect
                 if (!isManualDisconnect) {
                     scheduleReconnect(macIp, port, attempt)
                 }
             }
-
-            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                Log.d(TAG, "🔌 WebSocket closing: $code - $reason")
-                webSocket.close(1000, null)
-            }
-
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                Log.d(TAG, "🛑 WebSocket closed: $code - $reason")
-                updateStatus(ConnectionStatus.DISCONNECTED)
-
-                // Auto-reconnect unless manual disconnect
-                if (!isManualDisconnect) {
-                    scheduleReconnect(macIp, port, attempt)
-                }
-            }
-        })
-
-        updateStatus(ConnectionStatus.CONNECTING)
+        }
     }
 
     fun disconnect() {
         isManualDisconnect = true
         reconnectJob?.cancel()
-        webSocket?.close(1000, "User disconnected")
-        webSocket = null
+        receiveJob?.cancel()
+
+        try {
+            outputStream?.close()
+            inputStream?.close()
+            socket?.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error closing socket: ${e.message}")
+        }
+
+        socket = null
+        outputStream = null
+        inputStream = null
+
         updateStatus(ConnectionStatus.DISCONNECTED)
         Log.d(TAG, "🛑 Disconnected")
     }
@@ -114,21 +106,68 @@ class NetworkManager(
         Log.d(TAG, "🤝 Sent handshake")
     }
 
-    // Send sync message
+    // Send sync message with length-prefix framing
     fun sendMessage(message: SyncMessage): Boolean {
-        val ws = webSocket ?: run {
-            Log.e(TAG, "❌ WebSocket not connected")
+        val out = outputStream ?: run {
+            Log.e(TAG, "❌ Socket not connected")
             return false
         }
 
         return try {
             val json = Json.encodeToString(message)
-            ws.send(json)
-            Log.d(TAG, "✅ Sent ${message.type} message")
+            val messageBytes = json.toByteArray(Charsets.UTF_8)
+
+            synchronized(out) {
+                // Send 4-byte length prefix (big-endian)
+                out.writeInt(messageBytes.size)
+                // Send actual message
+                out.write(messageBytes)
+                out.flush()
+            }
+
+            Log.d(TAG, "✅ Sent ${message.type} message (${messageBytes.size} bytes)")
             true
+
         } catch (e: Exception) {
             Log.e(TAG, "❌ Send failed: ${e.message}")
+            handleConnectionError(e)
             false
+        }
+    }
+
+    // Start receiving messages with length-prefix framing
+    private fun startReceiving() {
+        receiveJob = scope.launch {
+            val stream = inputStream ?: return@launch
+
+            try {
+                while (isActive && socket?.isConnected == true) {
+                    // Read 4-byte length prefix
+                    val length = stream.readInt()
+
+                    if (length <= 0 || length > 1_000_000) { // Sanity check: max 1MB
+                        Log.e(TAG, "❌ Invalid message length: $length")
+                        break
+                    }
+
+                    // Read exact message bytes
+                    val messageBytes = ByteArray(length)
+                    stream.readFully(messageBytes)
+
+                    // Decode and handle
+                    val json = String(messageBytes, Charsets.UTF_8)
+                    Log.d(TAG, "📨 Received ${messageBytes.size} bytes")
+                    handleMessage(json)
+                }
+            } catch (e: SocketException) {
+                Log.e(TAG, "🔌 Socket closed: ${e.message}")
+            } catch (e: EOFException) {
+                Log.e(TAG, "🔌 Connection closed by server")
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Receive error: ${e.message}")
+            } finally {
+                handleConnectionError(Exception("Connection closed"))
+            }
         }
     }
 
@@ -143,6 +182,24 @@ class NetworkManager(
             }
         } catch (e: Exception) {
             Log.e(TAG, "❌ Failed to decode message: ${e.message}")
+            Log.e(TAG, "Raw: ${text.take(100)}")
+        }
+    }
+
+    // Handle connection errors
+    private fun handleConnectionError(error: Exception) {
+        updateStatus(ConnectionStatus.ERROR(error.message ?: "Unknown error"))
+
+        // Save connection params for reconnect
+        val currentSocket = socket
+        val host = currentSocket?.inetAddress?.hostAddress
+        val port = currentSocket?.port ?: 8765
+
+        disconnect()
+
+        // Auto-reconnect
+        if (!isManualDisconnect && host != null) {
+            scheduleReconnect(host, port, 1)
         }
     }
 
@@ -164,7 +221,7 @@ class NetworkManager(
 
     private fun updateStatus(status: ConnectionStatus) {
         connectionStatus = status
-        onConnectionStatusChanged?.invoke(status)
+        onConnectionStatusChanged?.invoke(status)  // Direct callback
     }
 
     fun cleanup() {
